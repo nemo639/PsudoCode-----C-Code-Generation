@@ -32,7 +32,7 @@ def load_model():
     try:
         with st.spinner("🔄 Loading model... This may take a minute..."):
             # IMPORTANT: Replace with your Hugging Face model ID
-            MODEL_ID = "https://huggingface.co/naeaeaem/gpt2-finetuned"
+            MODEL_ID = "naeaeaem/gpt2-finetuned"
             
             base_model = AutoModelForCausalLM.from_pretrained("gpt2")
             tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
