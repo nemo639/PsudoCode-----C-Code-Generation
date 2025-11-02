@@ -3,103 +3,137 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel, PeftConfig
 import torch
 from huggingface_hub import hf_hub_list, hf_hub_download, RepositoryNotFoundError, HfHubHTTPError
+import json
+import os
 
-st.set_page_config(page_title="Pseudocode → C++ (debug loader)", page_icon="🐍", layout="wide")
-
-st.markdown("# 🐍 Pseudocode → C++ (robust loader with diagnostics)")
-
+# -------------------------
+# Configuration
+# -------------------------
 MODEL_ID = "naeaeaem/gpt2-finetuned"  # <-- replace if needed
 
+st.set_page_config(page_title="Pseudocode → C++ (robust loader)", page_icon="🐍", layout="wide")
 
+st.markdown(
+    """
+    # 🐍 Pseudocode → C++
+    Robust model loader for PEFT adapter and full model repos.
+    """
+)
+
+# -------------------------
+# Helpers: inspect repo
+# -------------------------
 @st.cache_resource
-def inspect_repo(model_id):
-    """Return list of files in the HF repo (or error message)."""
+def repo_files(model_id: str):
     try:
         files = hf_hub_list(model_id)
-        return {"ok": True, "files": [f.rfilename for f in files]}
+        # hf_hub_list returns objects with .rfilename (older) or str entries depending on version; normalize
+        file_list = []
+        for f in files:
+            try:
+                file_list.append(f.rfilename)
+            except Exception:
+                file_list.append(str(f))
+        return {"ok": True, "files": file_list}
     except RepositoryNotFoundError:
-        return {"ok": False, "error": f"Repository `{model_id}` not found (RepositoryNotFoundError)"}
+        return {"ok": False, "error": f"Repository '{model_id}' not found."}
     except HfHubHTTPError as e:
         return {"ok": False, "error": f"HfHubHTTPError: {e}"}
     except Exception as e:
         return {"ok": False, "error": f"Unknown error listing repo: {e}"}
 
-
+# -------------------------
+# Model loader (robust)
+# -------------------------
 @st.cache_resource
-def load_model_and_tokenizer(model_id):
+def load_model_and_tokenizer(model_id: str):
     """
-    Tries several strategies to load the model + tokenizer.
-    Returns tuple (model, tokenizer, device, debug_info)
-    debug_info is a dict with tracing info and repo file list.
+    Attempts multiple strategies to load:
+      1) PEFT adapter (read adapter_config.json -> load base -> attach adapter)
+      2) Full model (AutoModelForCausalLM.from_pretrained(model_id))
+      3) Base 'gpt2' fallback
+    Returns (model, tokenizer, device, debug_info)
     """
     debug = {"traces": []}
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    repo_inspect = inspect_repo(model_id)
-    debug["repo_inspect"] = repo_inspect
 
-    # Attempt 1: Assume repo is a PEFT adapter and contains a PeftConfig
+    # Repo file listing
+    repo_info = repo_files(model_id)
+    debug["repo_info"] = repo_info
+
+    # Attempt: if adapter_config.json present, use it to get base model
     try:
-        debug["traces"].append("Attempt: PeftConfig.from_pretrained()")
-        peft_conf = PeftConfig.from_pretrained(model_id)
-        debug["traces"].append(f"PeftConfig found: base_model_name_or_path={peft_conf.base_model_name_or_path}")
-        tokenizer = None
-        # load tokenizer: try model_id then fallback to base_model_name_or_path
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            debug["traces"].append("Tokenizer loaded from model_id")
-        except Exception as te:
+        debug["traces"].append("Checking for adapter_config.json in repo...")
+        if repo_info.get("ok") and any(fname.endswith("adapter_config.json") or "adapter_config.json" in fname for fname in repo_info.get("files", [])):
+            debug["traces"].append("adapter_config.json detected in repo. Downloading...")
+            cfg_path = hf_hub_download(repo_id=model_id, filename="adapter_config.json")
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            base_model_name = cfg.get("base_model_name_or_path") or cfg.get("base_model") or "gpt2"
+            debug["traces"].append(f"adapter_config.json parsed. base_model_name_or_path = {base_model_name}")
+
+            # tokenizer: prefer repo tokenizer files if present
             try:
-                tokenizer = AutoTokenizer.from_pretrained(peft_conf.base_model_name_or_path)
-                debug["traces"].append("Tokenizer loaded from base_model_name_or_path")
-            except Exception as te2:
-                debug["traces"].append(f"Tokenizer load fallback failed: {te2}")
-                tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                debug["traces"].append("Tokenizer fallback to 'gpt2'")
+                debug["traces"].append("Attempting to load tokenizer from repo...")
+                tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+                debug["traces"].append("Tokenizer loaded from repo.")
+            except Exception as e_tok_repo:
+                debug["traces"].append(f"Tokenizer from repo failed: {e_tok_repo}. Falling back to base tokenizer '{base_model_name}' or 'gpt2'.")
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
+                    debug["traces"].append(f"Tokenizer loaded from base_model_name '{base_model_name}'.")
+                except Exception as e_tok_base:
+                    tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
+                    debug["traces"].append("Tokenizer fallback to 'gpt2' succeeded.")
 
-        base_model = AutoModelForCausalLM.from_pretrained(peft_conf.base_model_name_or_path)
-        debug["traces"].append(f"Base model loaded: {peft_conf.base_model_name_or_path}")
-        model = PeftModel.from_pretrained(base_model, model_id)
-        debug["traces"].append("PeftModel.from_pretrained succeeded")
-        model = model.to(device).eval()
-        return model, tokenizer, device, debug
-    except Exception as e_peft:
-        debug["traces"].append(f"Peft attempt failed: {repr(e_peft)}")
+            # Load base model then attach PEFT adapter
+            debug["traces"].append(f"Loading base model '{base_model_name}'...")
+            base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
+            debug["traces"].append("Base model loaded. Attaching PEFT adapter from repo...")
+            model = PeftModel.from_pretrained(base_model, model_id)
+            model = model.to(device).eval()
+            debug["traces"].append("PeftModel.from_pretrained succeeded.")
+            return model, tokenizer, device, debug
+        else:
+            debug["traces"].append("No adapter_config.json detected in repo.")
+    except Exception as e_adapter:
+        debug["traces"].append(f"PEFT adapter path failed: {repr(e_adapter)}")
 
-    # Attempt 2: Try loading the repo as a full AutoModel
+    # Attempt: load repo as a full model (AutoModelForCausalLM)
     try:
-        debug["traces"].append("Attempt: AutoModelForCausalLM.from_pretrained(MODEL_ID)")
-        tokenizer = None
+        debug["traces"].append("Attempting to load repo as a full model with AutoModelForCausalLM...")
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            debug["traces"].append("Tokenizer loaded from model_id (full model path)")
+            tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+            debug["traces"].append("Tokenizer loaded from repo (full-model attempt).")
         except Exception as te:
-            tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            debug["traces"].append(f"Tokenizer load from model_id failed: {te}; fallback to 'gpt2'")
-
+            tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
+            debug["traces"].append(f"Tokenizer load from repo failed ({te}); fallback to 'gpt2' tokenizer.")
         model = AutoModelForCausalLM.from_pretrained(model_id)
-        debug["traces"].append("AutoModelForCausalLM.from_pretrained succeeded")
         model = model.to(device).eval()
+        debug["traces"].append("AutoModelForCausalLM.from_pretrained(repo) succeeded.")
         return model, tokenizer, device, debug
     except Exception as e_full:
-        debug["traces"].append(f"Full-model attempt failed: {repr(e_full)}")
+        debug["traces"].append(f"Full-model load attempt failed: {repr(e_full)}")
 
-    # Attempt 3: Load base GPT-2 (no adapter) and tell user to provide adapter
+    # Final fallback: base gpt2
     try:
-        debug["traces"].append("Attempt: load base 'gpt2' (no adapter).")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        base_model = AutoModelForCausalLM.from_pretrained("gpt2")
-        base_model = base_model.to(device).eval()
-        debug["traces"].append("Base gpt2 loaded")
-        return base_model, tokenizer, device, debug
+        debug["traces"].append("Final fallback: loading base 'gpt2' model & tokenizer.")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
+        model = AutoModelForCausalLM.from_pretrained("gpt2").to(device).eval()
+        debug["traces"].append("Base 'gpt2' loaded successfully.")
+        return model, tokenizer, device, debug
     except Exception as e_base:
-        debug["traces"].append(f"Base model attempt failed: {repr(e_base)}")
+        debug["traces"].append(f"Base fallback failed: {repr(e_base)}")
         return None, None, None, debug
 
-
+# -------------------------
+# Generation function
+# -------------------------
 def generate_code(model, tokenizer, device, pseudo, max_new_tokens=120, num_beams=5):
     SPECIAL_PSEUDO = "<|pseudo|>"
     SPECIAL_CODE = "<|code|>"
     prompt = f"{SPECIAL_PSEUDO}\n{pseudo.strip()}\n{SPECIAL_CODE}\n"
+
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=450).to(device)
     with torch.no_grad():
         outputs = model.generate(
@@ -111,77 +145,95 @@ def generate_code(model, tokenizer, device, pseudo, max_new_tokens=120, num_beam
             repetition_penalty=1.2,
             pad_token_id=tokenizer.eos_token_id
         )
+
     gen_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
-    result = gen_text.split(SPECIAL_CODE, 1)[1] if SPECIAL_CODE in gen_text else gen_text[len(prompt):]
+    if SPECIAL_CODE in gen_text:
+        result = gen_text.split(SPECIAL_CODE, 1)[1]
+    else:
+        result = gen_text[len(prompt):]
+
     for stop in [SPECIAL_PSEUDO, SPECIAL_CODE, "<|endoftext|>"]:
         if stop in result:
             result = result.split(stop)[0]
             break
+
     return result.strip()
 
-
+# -------------------------
+# UI / Main
+# -------------------------
 def main():
-    st.sidebar.title("⚙️ Settings")
-    st.sidebar.write("MODEL_ID = `" + MODEL_ID + "` (change at top of file if needed)")
+    st.sidebar.title("⚙️ Settings & Diagnostics")
+    st.sidebar.write(f"MODEL_ID = `{MODEL_ID}` (edit top of file if needed)")
 
+    # Load model & tokenizer (shows cached results if re-run)
     model, tokenizer, device, debug = load_model_and_tokenizer(MODEL_ID)
 
+    # Show repo inspection
     st.subheader("Repository inspection")
-    if debug and "repo_inspect" in debug:
-        ri = debug["repo_inspect"]
-        if ri.get("ok"):
+    repo_info = debug.get("repo_info") if debug else None
+    if repo_info:
+        if repo_info.get("ok"):
             st.write("Files in repo (first 200):")
-            st.write(ri["files"][:200])
-            if any(f.lower().endswith(("adapter_model.bin", "adapter_config.json", "pytorch_model.bin")) for f in ri["files"]):
-                st.success("Repo appears to contain model/adapter files (good).")
+            st.write(repo_info.get("files")[:200])
+            # Quick hint if adapter files present
+            if any(name.lower().endswith(("adapter_model.safetensors", "adapter_model.bin", "adapter_config.json", "pytorch_model.bin")) for name in repo_info.get("files", [])):
+                st.success("Repository appears to contain adapter/model files.")
         else:
-            st.error("Could not list repo files: " + ri.get("error", "unknown"))
+            st.error("Could not list repo files: " + repo_info.get("error", "unknown"))
 
-    st.subheader("Loader traces")
-    if debug and "traces" in debug:
+    # Loader traces
+    st.subheader("Loader traces (debug)")
+    if debug and debug.get("traces"):
         for t in debug["traces"]:
             st.text("- " + t)
 
+    # If no model / tokenizer
     if model is None or tokenizer is None:
-        st.error("❌ Model/tokenizer failed to load. See traces above. Likely causes:")
-        st.markdown(
+        st.error("❌ Model/tokenizer failed to load. See loader traces above for details.")
+        st.info(
             """
-            - Repo is not a PEFT adapter or full model in expected format.  
-            - Tokenizer is missing from the repo (common for adapter-only repos).  
-            - `peft` / `transformers` version mismatch.  
-            
-            **Next steps:**  
-            1. Check the repo files above — does it have `adapter_config.json`, `adapter_model.bin`, or `pytorch_model.bin`?  
-            2. If the repo is adapter-only, set `tokenizer = AutoTokenizer.from_pretrained('gpt2')` or upload tokenizer files to the repo.  
-            3. If you fine-tuned locally, export with `peft_model.save_pretrained(...)` and upload that folder to HF (include adapter files + adapter_config).  
-            4. Consider loading the full merged model (use `AutoModelForCausalLM.from_pretrained` after merging weights).
+            Common fixes:
+            - If repo contains a PEFT adapter, ensure `adapter_config.json` lists `base_model_name_or_path`.
+            - If repo is adapter-only, keep tokenizer files in the repo (tokenizer.json/vocab/merges) or use `AutoTokenizer.from_pretrained('gpt2')`.
+            - If you fine-tuned locally, export with `peft_model.save_pretrained(...)` and upload the folder to HF (use git-lfs for large files).
+            - Ensure `peft`, `transformers`, `huggingface_hub`, and `safetensors` are in requirements.
             """
         )
         st.stop()
 
     st.success(f"✅ Model loaded and running on {device.upper()}")
 
+    # Generation UI
     st.markdown("---")
     st.header("Generate C++ from pseudocode")
     col1, col2 = st.columns(2)
+
     with col1:
-        pseudocode = st.text_area("Enter pseudocode:", value="read integer n\nfor i from 1 to n\n  print i", height=300)
+        st.subheader("📝 Input Pseudocode")
+        default_pseudo = "read integer n\nfor i from 1 to n\n  print i"
+        pseudo = st.text_area("Enter pseudocode:", value=default_pseudo, height=300)
         max_tokens = st.slider("Max Tokens", 50, 200, 120)
         num_beams = st.slider("Beam Size", 1, 10, 5)
         generate = st.button("🚀 Generate")
+
     with col2:
-        st.subheader("Generated C++")
+        st.subheader("💻 Generated C++")
         if generate:
-            if not pseudocode.strip():
+            if not pseudo.strip():
                 st.warning("Enter pseudocode first")
             else:
                 with st.spinner("Generating..."):
                     try:
-                        out = generate_code(model, tokenizer, device, pseudocode, max_tokens, num_beams)
+                        out = generate_code(model, tokenizer, device, pseudo, max_tokens, num_beams)
                         st.code(out, language="cpp")
-                        st.download_button("Download", out, "generated.cpp", "text/plain")
+                        st.download_button("📥 Download code", out, file_name="generated_code.cpp", mime="text/plain")
                     except Exception as e:
                         st.error(f"Generation error: {e}")
+
+    st.markdown("---")
+    st.markdown("<div style='text-align:center;color:#888'>Built with Streamlit | GPT-2 + PEFT</div>", unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
     main()
