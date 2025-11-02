@@ -1,24 +1,26 @@
-# app.py - Fixed Streamlit app for GPT-2 Fine-tuned Model
+# app.py - Fixed with automatic config cleaning
 import streamlit as st
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
+from peft import PeftModel, LoraConfig
 import traceback
+import json
+from huggingface_hub import hf_hub_download
 
 # -------------------------
 # Configuration
 # -------------------------
-MODEL_ID = "naeaeaem/gpt2-finetuned"  # Your HuggingFace repo
+MODEL_ID = "naeaeaem/gpt2-finetuned"
 
 st.set_page_config(page_title="Pseudocode → C++", page_icon="🐍", layout="wide")
 
 # -------------------------
-# Model Loading
+# Model Loading with Config Fix
 # -------------------------
 @st.cache_resource
 def load_model_and_tokenizer(model_id: str):
     """
-    Load fine-tuned GPT-2 model with LoRA adapter
+    Load fine-tuned GPT-2 model with LoRA adapter (with automatic config fixing)
     """
     debug_info = []
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -29,32 +31,67 @@ def load_model_and_tokenizer(model_id: str):
         base_model = AutoModelForCausalLM.from_pretrained("gpt2")
         debug_info.append("✓ Base model loaded")
         
-        # Step 2: Load tokenizer from your repo (or fallback to base)
+        # Step 2: Load tokenizer
         debug_info.append(f"Loading tokenizer from {model_id}...")
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             debug_info.append("✓ Tokenizer loaded from repo")
         except Exception as e:
-            debug_info.append(f"⚠ Tokenizer from repo failed: {str(e)[:100]}")
-            debug_info.append("Loading base GPT-2 tokenizer...")
+            debug_info.append(f"⚠ Tokenizer from repo failed, using base")
             tokenizer = AutoTokenizer.from_pretrained("gpt2")
             debug_info.append("✓ Base tokenizer loaded")
         
-        # Ensure pad token is set
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Step 3: Resize embeddings if tokenizer has special tokens
+        # Step 3: Resize embeddings
         vocab_size = len(tokenizer)
         if vocab_size != base_model.config.vocab_size:
             debug_info.append(f"Resizing embeddings: {base_model.config.vocab_size} → {vocab_size}")
             base_model.resize_token_embeddings(vocab_size)
             debug_info.append("✓ Embeddings resized")
         
-        # Step 4: Load LoRA adapter
+        # Step 4: Load LoRA with config cleaning
         debug_info.append(f"Loading LoRA adapter from {model_id}...")
-        model = PeftModel.from_pretrained(base_model, model_id)
-        debug_info.append("✓ LoRA adapter loaded")
+        
+        try:
+            # Try direct loading first
+            model = PeftModel.from_pretrained(base_model, model_id)
+            debug_info.append("✓ LoRA adapter loaded directly")
+        except TypeError as e:
+            error_msg = str(e)
+            debug_info.append(f"⚠ Direct load failed: {error_msg[:100]}")
+            debug_info.append("Attempting to fix config...")
+            
+            # Download and clean config
+            config_path = hf_hub_download(repo_id=model_id, filename="adapter_config.json")
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            
+            debug_info.append(f"Original config keys: {len(config_dict)}")
+            
+            # Keep only peft 0.7.1 compatible parameters
+            compatible_params = {
+                'auto_mapping', 'base_model_name_or_path', 'bias', 
+                'fan_in_fan_out', 'inference_mode', 'init_lora_weights',
+                'lora_alpha', 'lora_dropout', 'modules_to_save', 'peft_type',
+                'r', 'target_modules', 'task_type', 'revision'
+            }
+            
+            cleaned_config = {k: v for k, v in config_dict.items() if k in compatible_params}
+            debug_info.append(f"Cleaned config keys: {len(cleaned_config)}")
+            
+            # Create LoraConfig with cleaned parameters
+            lora_config = LoraConfig(**cleaned_config)
+            
+            # Load model with cleaned config
+            model = PeftModel.from_pretrained(
+                base_model, 
+                model_id,
+                config=lora_config,
+                ignore_mismatched_sizes=True
+            )
+            debug_info.append("✓ LoRA adapter loaded with cleaned config")
         
         # Step 5: Move to device
         model = model.to(device)
@@ -64,7 +101,7 @@ def load_model_and_tokenizer(model_id: str):
         return model, tokenizer, device, debug_info, None
         
     except Exception as e:
-        error_msg = f"Error loading model: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"Error: {str(e)}\n{traceback.format_exc()}"
         debug_info.append(f"❌ {error_msg}")
         return None, None, None, debug_info, error_msg
 
@@ -72,16 +109,11 @@ def load_model_and_tokenizer(model_id: str):
 # Code Generation
 # -------------------------
 def generate_code(model, tokenizer, device, pseudo, max_new_tokens=120, num_beams=5):
-    """
-    Generate C++ code from pseudocode
-    """
+    """Generate C++ code from pseudocode"""
     SPECIAL_PSEUDO = "<|pseudo|>"
     SPECIAL_CODE = "<|code|>"
     
-    # Build prompt
     prompt = f"{SPECIAL_PSEUDO}\n{pseudo.strip()}\n{SPECIAL_CODE}\n"
-    
-    # Tokenize
     inputs = tokenizer(
         prompt, 
         return_tensors="pt", 
@@ -89,7 +121,6 @@ def generate_code(model, tokenizer, device, pseudo, max_new_tokens=120, num_beam
         max_length=450
     ).to(device)
     
-    # Generate
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -102,16 +133,13 @@ def generate_code(model, tokenizer, device, pseudo, max_new_tokens=120, num_beam
             eos_token_id=tokenizer.eos_token_id
         )
     
-    # Decode
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
     
-    # Extract code after SPECIAL_CODE
     if SPECIAL_CODE in generated_text:
         code = generated_text.split(SPECIAL_CODE, 1)[1]
     else:
         code = generated_text[len(prompt):]
     
-    # Stop at special tokens
     for stop in [SPECIAL_PSEUDO, SPECIAL_CODE, "<|endoftext|>"]:
         if stop in code:
             code = code.split(stop)[0]
@@ -144,11 +172,11 @@ with st.sidebar.expander("🔍 Loader Traces", expanded=False):
     for info in debug_info:
         st.text(info)
 
-# Check if model loaded successfully
 if model is None or error:
     st.error("❌ Failed to load model!")
     if error:
         st.error(error)
+    st.info("💡 Try: Clear cache and retry (Settings → Clear cache)")
     st.stop()
 
 st.sidebar.success(f"✅ Model ready ({device.upper()})")
@@ -162,93 +190,50 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("📝 Input Pseudocode")
     
-    # Example pseudocodes
     examples = {
         "Simple I/O": "read integer n\nprint n",
         "Conditional": "read integer n\nif n greater than 0\n  print n",
         "Loop": "for i from 1 to 10\n  print i",
         "Addition": "read integer x\nread integer y\nprint x plus y",
-        "Nested Loop": "read integer n\nfor i from 1 to n\n  if i modulo 2 equals 0\n    print i"
+        "Nested": "read integer n\nfor i from 1 to n\n  if i modulo 2 equals 0\n    print i"
     }
     
-    selected_example = st.selectbox("Choose an example:", list(examples.keys()))
-    default_pseudo = examples[selected_example]
+    selected = st.selectbox("Choose example:", list(examples.keys()))
     
     pseudo = st.text_area(
         "Enter pseudocode:", 
-        value=default_pseudo, 
-        height=250,
-        help="Enter your pseudocode line by line"
+        value=examples[selected], 
+        height=250
     )
     
-    generate_btn = st.button("🚀 Generate C++ Code", type="primary", use_container_width=True)
+    generate_btn = st.button("🚀 Generate", type="primary", use_container_width=True)
 
 with col2:
-    st.subheader("💻 Generated C++ Code")
+    st.subheader("💻 Generated C++")
     
     if generate_btn:
         if not pseudo.strip():
-            st.warning("⚠️ Please enter pseudocode first!")
+            st.warning("⚠️ Please enter pseudocode!")
         else:
-            with st.spinner("Generating code..."):
+            with st.spinner("Generating..."):
                 try:
-                    code = generate_code(
-                        model, 
-                        tokenizer, 
-                        device, 
-                        pseudo, 
-                        max_tokens, 
-                        num_beams
-                    )
+                    code = generate_code(model, tokenizer, device, pseudo, max_tokens, num_beams)
                     
                     if code:
                         st.code(code, language="cpp")
-                        
-                        # Download button
                         st.download_button(
-                            label="📥 Download C++ Code",
-                            data=code,
-                            file_name="generated_code.cpp",
-                            mime="text/plain",
+                            "📥 Download",
+                            code,
+                            "generated.cpp",
                             use_container_width=True
                         )
                     else:
-                        st.warning("⚠️ Generated code is empty. Try adjusting parameters.")
-                        
+                        st.warning("⚠️ Empty output")
                 except Exception as e:
-                    st.error(f"❌ Generation error: {str(e)}")
-                    with st.expander("See error details"):
-                        st.code(traceback.format_exc())
+                    st.error(f"❌ Error: {str(e)}")
     else:
-        st.info("👆 Click 'Generate C++ Code' to see the output")
+        st.info("👆 Click 'Generate' to see output")
 
 # Footer
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: gray;'>
-    <p>Built with 🤗 Transformers + PEFT + Streamlit</p>
-    <p>Model: GPT-2 fine-tuned on SPOC dataset (Pseudocode → C++)</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Additional info in expander
-with st.expander("ℹ️ About this model"):
-    st.markdown("""
-    ### Model Details
-    - **Base Model:** GPT-2
-    - **Fine-tuning Method:** LoRA (Low-Rank Adaptation)
-    - **Dataset:** SPOC (Pseudocode to Code)
-    - **Task:** Convert structured pseudocode to C++ code
-    
-    ### Evaluation Metrics
-    - **BLEU Score:** 13.93
-    - **CodeBLEU:** 0.41
-    - **Code Quality:** 64%
-    - **Success Rate:** 100%
-    
-    ### Usage Tips
-    - Write clear, structured pseudocode
-    - Use simple constructs (if, for, while)
-    - Specify data types (integer, string, etc.)
-    - Keep pseudocode concise
-    """)
+st.caption("Built with 🤗 Transformers + PEFT + Streamlit")
