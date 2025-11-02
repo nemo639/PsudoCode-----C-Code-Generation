@@ -2,7 +2,7 @@ import streamlit as st
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel, PeftConfig
 import torch
-from huggingface_hub import hf_hub_list, hf_hub_download, RepositoryNotFoundError, HfHubHTTPError
+from huggingface_hub import hf_hub_download, HfApi, RepositoryNotFoundError, HfHubHTTPError
 import json
 import os
 
@@ -21,20 +21,15 @@ st.markdown(
 )
 
 # -------------------------
-# Helpers: inspect repo
+# Helpers: inspect repo (uses HfApi.list_repo_files for compatibility)
 # -------------------------
 @st.cache_resource
 def repo_files(model_id: str):
     try:
-        files = hf_hub_list(model_id)
-        # hf_hub_list returns objects with .rfilename (older) or str entries depending on version; normalize
-        file_list = []
-        for f in files:
-            try:
-                file_list.append(f.rfilename)
-            except Exception:
-                file_list.append(str(f))
-        return {"ok": True, "files": file_list}
+        api = HfApi()
+        files = api.list_repo_files(model_id)
+        # list_repo_files returns list[str]
+        return {"ok": True, "files": files}
     except RepositoryNotFoundError:
         return {"ok": False, "error": f"Repository '{model_id}' not found."}
     except HfHubHTTPError as e:
@@ -64,7 +59,7 @@ def load_model_and_tokenizer(model_id: str):
     # Attempt: if adapter_config.json present, use it to get base model
     try:
         debug["traces"].append("Checking for adapter_config.json in repo...")
-        if repo_info.get("ok") and any(fname.endswith("adapter_config.json") or "adapter_config.json" in fname for fname in repo_info.get("files", [])):
+        if repo_info.get("ok") and any("adapter_config.json" in fname for fname in repo_info.get("files", [])):
             debug["traces"].append("adapter_config.json detected in repo. Downloading...")
             cfg_path = hf_hub_download(repo_id=model_id, filename="adapter_config.json")
             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -82,7 +77,7 @@ def load_model_and_tokenizer(model_id: str):
                 try:
                     tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
                     debug["traces"].append(f"Tokenizer loaded from base_model_name '{base_model_name}'.")
-                except Exception as e_tok_base:
+                except Exception:
                     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
                     debug["traces"].append("Tokenizer fallback to 'gpt2' succeeded.")
 
@@ -176,7 +171,6 @@ def main():
         if repo_info.get("ok"):
             st.write("Files in repo (first 200):")
             st.write(repo_info.get("files")[:200])
-            # Quick hint if adapter files present
             if any(name.lower().endswith(("adapter_model.safetensors", "adapter_model.bin", "adapter_config.json", "pytorch_model.bin")) for name in repo_info.get("files", [])):
                 st.success("Repository appears to contain adapter/model files.")
         else:
